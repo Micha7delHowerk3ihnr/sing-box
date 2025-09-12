@@ -141,7 +141,7 @@ func New(options Options) (*Box, error) {
 	}
 	platformInterface := service.FromContext[platform.Interface](ctx)
 	var defaultLogWriter io.Writer
-	if platformInterface != nil {
+	if platformInterface != nil || options.PlatformLogWriter != nil {
 		defaultLogWriter = io.Discard
 	}
 	logFactory, err := log.New(log.Options{
