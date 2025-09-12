@@ -139,6 +139,26 @@ func (i *Instance) PauseManager() pause.Manager {
 	return i.pauseManager
 }
 
+// Context returns the context used by this instance.
+func (i *Instance) Context() context.Context {
+	return i.ctx
+}
+
+// ConnectionManager returns the connection manager for this instance, if available.
+func (i *Instance) ConnectionManager() adapter.ConnectionManager {
+	return i.connectionManager
+}
+
+// ClashServer returns the clash API server for this instance, if available.
+func (i *Instance) ClashServer() adapter.ClashServer {
+	return i.clashServer
+}
+
+// URLTestHistoryStorage returns the URL test history store for this instance.
+func (i *Instance) URLTestHistoryStorage() *urltest.HistoryStorage {
+	return i.urlTestHistoryStorage
+}
+
 func parseConfig(ctx context.Context, configContent string) (option.Options, error) {
 	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
 	if err != nil {
