@@ -1,11 +1,9 @@
-//go:build !unix && !windows
+//go:build windows
 
 package libbox
 
-import (
-	"net"
-)
+import "net"
 
 func linkFlags(rawFlags uint32) net.Flags {
-	panic("stub!")
+	return net.Flags(rawFlags)
 }
