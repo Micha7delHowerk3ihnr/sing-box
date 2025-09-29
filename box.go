@@ -284,16 +284,32 @@ func New(options Options) (*Box, error) {
 				Outbound: tag,
 			})
 		}
+		outboundLogger := logFactory.NewLogger(F.ToString("outbound/", outboundOptions.Type, "[", tag, "]"))
 		err = outboundManager.Create(
 			outboundCtx,
 			router,
-			logFactory.NewLogger(F.ToString("outbound/", outboundOptions.Type, "[", tag, "]")),
+			outboundLogger,
 			tag,
 			outboundOptions.Type,
 			outboundOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize outbound[", i, "]")
+			err = E.Cause(err, "initialize outbound[", i, "]")
+			outboundLogger.Error(err)
+			fallbackLogger := logFactory.NewLogger(F.ToString("outbound/", C.TypeBlock, "[", tag, "]"))
+			fallbackErr := outboundManager.Create(
+				outboundCtx,
+				router,
+				fallbackLogger,
+				tag,
+				C.TypeBlock,
+				&option.StubOptions{},
+			)
+			if fallbackErr != nil {
+				fallbackLogger.Error(E.Cause(fallbackErr, "initialize fallback block outbound[", tag, "]"))
+				return nil, err
+			}
+			continue
 		}
 	}
 	for i, serviceOptions := range options.Services {
