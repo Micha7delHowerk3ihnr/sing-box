@@ -32,6 +32,32 @@ type PlatformInterface interface {
 	CreateBridge(options *BridgeOptions) (BridgeSession, error)
 }
 
+type PacketTunnel interface {
+	ReadPacket() (*Packet, error)
+	WritePacket(packet *Packet) error
+	Start() error
+	Close() error
+	UpdateRouteOptions(options TunOptions) error
+	Name() string
+}
+
+type Packet struct {
+	data           []byte
+	protocolFamily int32
+}
+
+func NewPacket(data []byte, protocolFamily int32) *Packet {
+	return &Packet{data: append([]byte(nil), data...), protocolFamily: protocolFamily}
+}
+
+func (p *Packet) Bytes() []byte {
+	return append([]byte(nil), p.data...)
+}
+
+func (p *Packet) ProtocolFamily() int32 {
+	return p.protocolFamily
+}
+
 type BridgeOptions struct {
 	BridgeName string
 	MTU        int32

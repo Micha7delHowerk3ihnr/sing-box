@@ -158,7 +158,11 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 		}
 	}
 	if f.needObservable {
-		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
+		f.subscriber.Emit(Entry{
+			Time:    timestamp,
+			Level:   level,
+			Message: f.formatter.FormatSimple(ctx, tag, message),
+		})
 	}
 	platformWriters := f.loadPlatformWriters()
 	if len(platformWriters) > 0 {

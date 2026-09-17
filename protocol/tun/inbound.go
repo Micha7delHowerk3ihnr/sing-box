@@ -17,7 +17,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-tun"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -425,6 +425,13 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			}
 		}
 		monitor.Start("open interface")
+		if packetPlatform, loaded := t.platformInterface.(interface{ UsePlatformPacketInterface() bool }); loaded && packetPlatform.UsePlatformPacketInterface() {
+			if t.stack == "" {
+				t.stack = "system"
+			} else if t.stack != "system" {
+				return E.New("supplied packet interface currently supports only the system stack")
+			}
+		}
 		if t.platformInterface != nil && t.platformInterface.UsePlatformInterface() {
 			tunInterface, err = t.platformInterface.OpenInterface(&tunOptions, t.platformOptions)
 		} else {
