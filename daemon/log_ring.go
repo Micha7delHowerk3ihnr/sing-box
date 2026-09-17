@@ -8,6 +8,7 @@ type logRing struct {
 	entries  []*log.Entry
 	maxLines int
 	start    int
+	dropped  uint64
 }
 
 func (r *logRing) push(entry *log.Entry) {
@@ -18,6 +19,7 @@ func (r *logRing) push(entry *log.Entry) {
 		r.entries = append(r.entries, entry)
 		return
 	}
+	r.dropped++
 	r.entries[r.start] = entry
 	r.start++
 	if r.start == len(r.entries) {
@@ -36,4 +38,5 @@ func (r *logRing) reset() {
 	clear(r.entries)
 	r.entries = r.entries[:0]
 	r.start = 0
+	r.dropped = 0
 }

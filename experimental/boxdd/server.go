@@ -32,6 +32,7 @@ type Daemon struct {
 	ctx                     context.Context
 	logger                  log.ContextLogger
 	startedService          *daemon.StartedService
+	runtime                 *daemon.Runtime
 	powerManager            *powerreport.Manager
 	oomRecorder             *oomkiller.Recorder
 	server                  *grpc.Server
@@ -64,6 +65,7 @@ func newDaemon() (*Daemon, error) {
 		Context:     ctx,
 		LogMaxLines: 3000,
 	})
+	d.runtime = daemon.NewRuntime(ctx, d.startedService)
 	d.oomRecorder = oomkiller.NewRecorder(libbox.OOMRecorderOptions(d.startedService))
 	service.MustRegister[*oomkiller.Recorder](ctx, d.oomRecorder)
 	d.oomRecorder.Start()
@@ -237,7 +239,7 @@ func (d *Daemon) startServiceLocked(ctx context.Context, ownerUserID string, con
 			return err
 		}
 	}
-	err = d.startedService.StartOrReloadService(ctx, configContent, nil)
+	err = d.runtime.Apply(ctx, []byte(configContent), nil)
 	if err != nil && d.platform != nil {
 		return E.Errors(err, d.platform.ResetPlatformOptions())
 	}
@@ -256,7 +258,7 @@ func (d *Daemon) stopServiceLocked(ownerUserID string) error {
 		}
 	}
 	if d.startedService.Instance() != nil {
-		err = d.startedService.CloseService()
+		_, err = d.runtime.Stop(context.Background())
 		if err != nil {
 			return err
 		}
@@ -289,8 +291,7 @@ func (d *Daemon) Close() {
 	if d.platform != nil {
 		_ = d.platform.ResetPlatformOptions()
 	}
-	_ = d.startedService.CloseService()
-	d.startedService.Close()
+	_, _ = d.runtime.Shutdown(context.Background())
 	_ = d.oomRecorder.Close()
 	if d.platform != nil {
 		_ = d.platform.Close()

@@ -300,7 +300,7 @@ func (d *Daemon) cleanFailedStartLocked(ownerUserID string, options startOptions
 		platformError = d.platform.ResetPlatformOptions()
 	}
 	if d.startedService.Instance() != nil {
-		_ = d.startedService.CloseService()
+		_, _ = d.runtime.Stop(context.Background())
 	}
 	directory := userWorkingDirectory(ownerUserID)
 	crashReportError := tagUnownedReports(filepath.Join(directory, crashReportsDirectoryName), ownerUserID)
