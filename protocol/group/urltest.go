@@ -5,7 +5,6 @@ import (
 	"maps"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -218,7 +217,7 @@ type URLTestGroup struct {
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
-	checking                     atomic.Bool
+	checking                     chan struct{}
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -258,6 +257,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
 		history:                      history,
+		checking:                     make(chan struct{}, 1),
 		close:                        make(chan struct{}),
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
@@ -382,11 +382,34 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	if g.checking.Swap(true) {
-		return make(map[string]uint16), nil
+	if force {
+		// A network update must run after an in-flight startup or periodic test,
+		// since that test may still be using the previous network environment.
+		select {
+		case g.checking <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-g.ctx.Done():
+			return nil, g.ctx.Err()
+		}
+	} else {
+		select {
+		case g.checking <- struct{}{}:
+		default:
+			return make(map[string]uint16), nil
+		}
 	}
-	defer g.checking.Store(false)
+	defer func() { <-g.checking }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := g.ctx.Err(); err != nil {
+		return nil, err
+	}
 	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	g.performUpdateCheck()
 	return result, nil
 }
@@ -473,6 +496,12 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				case testResult = <-testChan:
 				case <-testCtx.Done():
 					testResult.err = testCtx.Err()
+				}
+				// Cancellation of the whole batch says nothing about node health.
+				// Keep existing history; a per-node timeout still counts as failure.
+				if err := b.ctx.Err(); err != nil {
+					b.logger.Debug("outbound ", tag, " URL test canceled: ", err)
+					return nil, nil
 				}
 				if testResult.err != nil {
 					if b.ctx.Err() != nil {

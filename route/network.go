@@ -471,14 +471,23 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 		}
 	}
 
+	var groupListeners []adapter.InterfaceUpdateListener
 	for _, outbound := range r.outbound.Outbounds() {
 		listener, isListener := outbound.(adapter.InterfaceUpdateListener)
 		if isListener {
-			listener.InterfaceUpdated(ctx)
+			if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+				groupListeners = append(groupListeners, listener)
+			} else {
+				listener.InterfaceUpdated(ctx)
+			}
 		}
 	}
 
 	r.router.ResetNetwork()
+	// Start group probes only after their transports and DNS have been reset.
+	for _, listener := range groupListeners {
+		listener.InterfaceUpdated(ctx)
+	}
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(_ *control.Interface, _ int) {
@@ -577,6 +586,8 @@ func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 			previousCancel()
 		}
 		go func() {
+			// Keep asynchronous listener work alive until the next power update
+			// or manager shutdown, just like interface-triggered resets.
 			r.resetRunAccess.Lock()
 			defer r.resetRunAccess.Unlock()
 			if updateContext.Err() != nil {
