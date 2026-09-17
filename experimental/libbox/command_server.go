@@ -30,6 +30,7 @@ import (
 
 type CommandServer struct {
 	*daemon.StartedService
+	runtime           *daemon.Runtime
 	ctx               context.Context
 	managedService    *daemon.ManagedService
 	handler           CommandServerHandler
@@ -84,6 +85,7 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
 		// GroupID:          sGroupID,
 		// SystemProxyEnabled: false,
 	})
+	server.runtime = daemon.NewRuntime(ctx, server.StartedService)
 	oomRecorder := oomkiller.NewRecorder(OOMRecorderOptions(server.StartedService))
 	service.MustRegister[*oomkiller.Recorder](ctx, oomRecorder)
 	oomRecorder.Start()
@@ -139,6 +141,9 @@ func streamAuthInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServe
 }
 
 func (s *CommandServer) Start() error {
+	if s.grpcServer != nil {
+		return nil
+	}
 	var (
 		listener net.Listener
 		err      error
@@ -200,7 +205,7 @@ func (s *CommandServer) Close() {
 		s.grpcServer.Stop()
 	}
 	common.Close(s.listener)
-	s.StartedService.Close()
+	_, _ = s.runtime.Shutdown(context.Background())
 	s.oomRecorder.Close()
 	s.powerManager.Close()
 }
@@ -212,23 +217,69 @@ type OverrideOptions struct {
 }
 
 func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
+	err := s.runtime.Apply(s.ctx, []byte(configContent), daemonOverrideOptions(options))
+	if err != nil {
+		return E.Cause(err, "start or reload service")
+	}
+	s.recordSuccessfulConfig(configContent)
+	return nil
+}
+
+func daemonOverrideOptions(options *OverrideOptions) *daemon.OverrideOptions {
+	if options == nil {
+		return nil
+	}
+	return &daemon.OverrideOptions{
+		AutoRedirect:   options.AutoRedirect,
+		IncludePackage: iteratorToArray(options.IncludePackage),
+		ExcludePackage: iteratorToArray(options.ExcludePackage),
+	}
+}
+
+func (s *CommandServer) recordSuccessfulConfig(configContent string) {
 	saveConfigSnapshot(configContent)
 	if s.powerManager.Recorder() != nil {
 		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
 	}
-	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
-		AutoRedirect:   options.AutoRedirect,
-		IncludePackage: iteratorToArray(options.IncludePackage),
-		ExcludePackage: iteratorToArray(options.ExcludePackage),
-	})
-	if err != nil {
-		return E.Cause(err, "start or reload service")
+}
+
+func (s *CommandServer) StartService(ctx context.Context, configContent string, options *OverrideOptions) (daemon.RuntimeSnapshot, error) {
+	snapshot, err := s.runtime.Start(ctx, []byte(configContent), daemonOverrideOptions(options))
+	if err == nil {
+		s.recordSuccessfulConfig(configContent)
 	}
-	return nil
+	return snapshot, err
+}
+
+func (s *CommandServer) ReloadService(ctx context.Context, configContent string, options *OverrideOptions) (daemon.ReloadResult, error) {
+	result, err := s.runtime.Reload(ctx, []byte(configContent), daemonOverrideOptions(options))
+	if err == nil {
+		s.recordSuccessfulConfig(configContent)
+	}
+	return result, err
+}
+
+func (s *CommandServer) RestartService(ctx context.Context, options *OverrideOptions) (daemon.ReloadResult, error) {
+	return s.runtime.Restart(ctx, daemonOverrideOptions(options))
+}
+
+func (s *CommandServer) CancelActiveOperation() bool {
+	return s.runtime.CancelActive()
 }
 
 func (s *CommandServer) CloseService() error {
-	return s.StartedService.CloseService()
+	return s.StopService(context.Background())
+}
+
+func (s *CommandServer) StopService(ctx context.Context) error {
+	_, err := s.runtime.Stop(ctx)
+	return err
+}
+
+// Runtime exposes the single lifecycle authority used by both direct callers
+// and the optional gRPC adapters registered by CommandServer.Start.
+func (s *CommandServer) Runtime() *daemon.Runtime {
+	return s.runtime
 }
 
 func (s *CommandServer) WriteMessage(level int32, message string) {

@@ -509,18 +509,34 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 		}
 	}
 
+	var groupListeners []adapter.InterfaceUpdateListener
 	for _, outbound := range r.outbound.Outbounds() {
 		listener, isListener := outbound.(adapter.InterfaceUpdateListener)
 		if isListener {
-			listener.InterfaceUpdated(ctx)
+			if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+				groupListeners = append(groupListeners, listener)
+			} else {
+				listener.InterfaceUpdated(ctx)
+			}
 		}
 	}
 
 	r.router.ResetNetwork()
+	// Start group probes only after their transports and DNS have been reset.
+	for _, listener := range groupListeners {
+		listener.InterfaceUpdated(ctx)
+	}
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
 	if defaultInterface == nil {
+		r.interfaceUpdateAccess.Lock()
+		previousCancel := r.interfaceUpdateCancel
+		r.interfaceUpdateCancel = nil
+		r.interfaceUpdateAccess.Unlock()
+		if previousCancel != nil {
+			previousCancel()
+		}
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
 		return
@@ -534,10 +550,9 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	if previousCancel != nil {
 		previousCancel()
 	}
-	go func() {
-		defer updateCancel()
-		r.updateInterface(updateContext, defaultInterface)
-	}()
+	// Listeners may keep using this context after updateInterface returns.
+	// The next interface update or manager shutdown cancels their work.
+	go r.updateInterface(updateContext, defaultInterface)
 }
 
 func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface) {
@@ -606,7 +621,8 @@ func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 			previousCancel()
 		}
 		go func() {
-			defer updateCancel()
+			// Keep asynchronous listener work alive until the next power update
+			// or manager shutdown, just like interface-triggered resets.
 			r.resetRunAccess.Lock()
 			defer r.resetRunAccess.Unlock()
 			if updateContext.Err() != nil {

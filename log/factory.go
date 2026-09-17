@@ -1,6 +1,8 @@
 package log
 
 import (
+	"time"
+
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/observable"
 )
@@ -26,6 +28,8 @@ type ObservableFactory interface {
 }
 
 type Entry struct {
-	Level   Level
-	Message string
+	Sequence uint64
+	Time     time.Time
+	Level    Level
+	Message  string
 }

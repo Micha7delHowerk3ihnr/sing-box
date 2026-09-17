@@ -147,7 +147,12 @@ func (f *defaultFactory) UnSubscribe(sub observable.Subscription[Entry]) {
 }
 
 func (f *defaultFactory) output(ctx context.Context, level Level, tag string, message string, timestamp time.Time) {
-	if level <= f.level && (f.needConsole || level == LevelPanic || level == LevelFatal) {
+	// Recheck pending entries when Start drains them: the configured level may
+	// have changed since they were queued. Every output uses the same threshold.
+	if level > f.level {
+		return
+	}
+	if f.needConsole || level == LevelPanic || level == LevelFatal {
 		formatted := f.formatter.Format(ctx, level, tag, message, timestamp)
 		if level == LevelPanic {
 			panic(formatted)
@@ -158,7 +163,11 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 		}
 	}
 	if f.needObservable {
-		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
+		f.subscriber.Emit(Entry{
+			Time:    timestamp,
+			Level:   level,
+			Message: f.formatter.FormatSimple(ctx, tag, message),
+		})
 	}
 	platformWriters := f.loadPlatformWriters()
 	if len(platformWriters) > 0 {
@@ -178,8 +187,9 @@ type observableLogger struct {
 
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
-	platformWriters := l.loadPlatformWriters()
-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
+	// Subscribers and platform writers must not bypass the configured level.
+	// Reject before formatting or enqueueing, not only at the console writer.
+	if level > l.level {
 		return
 	}
 	nowTime := time.Now()

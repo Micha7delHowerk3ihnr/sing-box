@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"os"
 	"runtime"
@@ -63,6 +64,7 @@ type StartedService struct {
 	serviceStatusObserver   *observable.Observer[*ServiceStatus]
 	logAccess               sync.RWMutex
 	logLines                logRing
+	logSequence             uint64
 	logSubscriber           *observable.Subscriber[*log.Entry]
 	logObserver             *observable.Observer[*log.Entry]
 	instance                *Instance
@@ -73,6 +75,7 @@ type StartedService struct {
 	clashModeObserver       *observable.Observer[struct{}]
 	notificationSubscriber  *observable.Subscriber[*NotificationEvent]
 	notificationObserver    *observable.Observer[*NotificationEvent]
+	runtime                 *Runtime
 }
 
 type ServiceOptions struct {
@@ -246,6 +249,16 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
 }
 
 func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
+	s.serviceAccess.RLock()
+	runtime := s.runtime
+	s.serviceAccess.RUnlock()
+	if runtime != nil {
+		return runtime.Apply(ctx, []byte(profileContent), options)
+	}
+	return s.startOrReloadService(ctx, profileContent, options)
+}
+
+func (s *StartedService) startOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
 	s.interruptStart()
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
@@ -318,6 +331,17 @@ func (s *StartedService) Close() {
 }
 
 func (s *StartedService) CloseService() error {
+	s.serviceAccess.RLock()
+	runtime := s.runtime
+	s.serviceAccess.RUnlock()
+	if runtime != nil {
+		_, err := runtime.Stop(context.Background())
+		return err
+	}
+	return s.closeService()
+}
+
+func (s *StartedService) closeService() error {
 	s.interruptStart()
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
@@ -461,10 +485,9 @@ func (s *StartedService) SubscribeStatus(request *SubscribeStatusRequest, server
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	status := s.readStatus()
-	uploadTotal := status.UplinkTotal
-	downloadTotal := status.DownlinkTotal
+	sampler := s.NewStatusSampler()
 	for {
+		status := sampler.Read()
 		err := server.Send(status)
 		if err != nil {
 			return err
@@ -476,13 +499,6 @@ func (s *StartedService) SubscribeStatus(request *SubscribeStatusRequest, server
 			return server.Context().Err()
 		case <-ticker.C:
 		}
-		status = s.readStatus()
-		upload := status.UplinkTotal - uploadTotal
-		download := status.DownlinkTotal - downloadTotal
-		uploadTotal = status.UplinkTotal
-		downloadTotal = status.DownlinkTotal
-		status.Uplink = upload
-		status.Downlink = download
 	}
 }
 
@@ -502,6 +518,10 @@ func (s *StartedService) readStatus() *Status {
 		status.ConnectionsIn = int32(nowService.trafficManager.ConnectionsLen())
 	}
 	return &status
+}
+
+func (s *StartedService) ReadStatusSnapshot() *Status {
+	return s.readStatus()
 }
 
 func (s *StartedService) SubscribeGroups(empty *emptypb.Empty, server grpc.ServerStreamingServer[Groups]) error {
@@ -623,20 +643,53 @@ func (s *StartedService) readGroups() *Groups {
 	return &gs
 }
 
-func (s *StartedService) GetClashModeStatus(ctx context.Context, empty *emptypb.Empty) (*ClashModeStatus, error) {
+func (s *StartedService) ReadGroupsSnapshot() (*Groups, error) {
 	s.serviceAccess.RLock()
-	if s.serviceStatus.Status != ServiceStatus_STARTED {
-		s.serviceAccess.RUnlock()
+	defer s.serviceAccess.RUnlock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED || s.instance == nil {
 		return nil, os.ErrInvalid
 	}
-	clashMode := s.instance.clashMode
+	return s.readGroups(), nil
+}
+
+func (s *StartedService) ReadConnectionsSnapshot() ([]*Connection, error) {
+	s.serviceAccess.RLock()
+	instance := s.instance
 	s.serviceAccess.RUnlock()
-	if clashMode == nil {
-		return nil, status.Error(codes.NotFound, "clash mode not available")
+	if instance == nil || instance.trafficManager == nil {
+		return nil, os.ErrInvalid
+	}
+	connections := instance.trafficManager.Connections()
+	result := make([]*Connection, 0, len(connections))
+	for _, metadata := range connections {
+		result = append(result, buildConnectionProto(metadata))
+	}
+	return result, nil
+}
+
+func (s *StartedService) ReadLogsSnapshot() []*Log_Message {
+	s.logAccess.RLock()
+	lines := s.logLines.array()
+	s.logAccess.RUnlock()
+	return common.Map(lines, func(it *log.Entry) *Log_Message {
+		return &Log_Message{Level: LogLevel(it.Level), Message: it.Message}
+	})
+}
+
+func (s *StartedService) ReadLogEntriesSnapshot() ([]*log.Entry, uint64) {
+	s.logAccess.RLock()
+	defer s.logAccess.RUnlock()
+	return s.logLines.array(), s.logLines.dropped
+}
+
+func (s *StartedService) GetClashModeStatus(ctx context.Context, empty *emptypb.Empty) (*ClashModeStatus, error) {
+	runtimeStatus, err := s.ReadClashMode()
+	if err != nil {
+		return nil, grpcRuntimeControlError(err)
 	}
 	return &ClashModeStatus{
-		ModeList:    clashMode.ModeList(),
-		CurrentMode: clashMode.Mode(),
+		ModeList:    runtimeStatus.Modes,
+		CurrentMode: runtimeStatus.Current,
 	}, nil
 }
 
@@ -689,17 +742,9 @@ func (s *StartedService) SubscribeClashMode(empty *emptypb.Empty, server grpc.Se
 }
 
 func (s *StartedService) SetClashMode(ctx context.Context, request *ClashMode) (*emptypb.Empty, error) {
-	s.serviceAccess.RLock()
-	if s.serviceStatus.Status != ServiceStatus_STARTED {
-		s.serviceAccess.RUnlock()
-		return nil, os.ErrInvalid
+	if err := s.SetRuntimeClashMode(request.Mode); err != nil {
+		return nil, grpcRuntimeControlError(err)
 	}
-	clashMode := s.instance.clashMode
-	s.serviceAccess.RUnlock()
-	if clashMode == nil {
-		return nil, status.Error(codes.NotFound, "clash mode not available")
-	}
-	clashMode.SetMode(request.Mode)
 	return &emptypb.Empty{}, nil
 }
 
@@ -743,23 +788,44 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	return &emptypb.Empty{}, nil
 }
 
-func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutboundRequest) (*emptypb.Empty, error) {
+func (s *StartedService) RunURLTest(ctx context.Context, outboundTag string) (map[string]uint16, []string, error) {
 	s.serviceAccess.RLock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED {
+		s.serviceAccess.RUnlock()
+		return nil, nil, os.ErrInvalid
+	}
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
-	if boxService == nil {
-		return nil, os.ErrInvalid
-	}
-	outboundGroup, isLoaded := boxService.outboundManager.Outbound(request.GroupTag)
+	outbound, isLoaded := boxService.outboundManager.Outbound(outboundTag)
 	if !isLoaded {
-		return nil, status.Error(codes.NotFound, "selector not found: "+request.GroupTag)
+		return nil, nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
 	}
-	selector, isSelector := outboundGroup.(*group.Selector)
-	if !isSelector {
-		return nil, status.Error(codes.InvalidArgument, "outbound is not a selector: "+request.GroupTag)
+	historyStorage := boxService.urlTestHistoryStorage
+	if urlTest, isURLTest := outbound.(*group.URLTest); isURLTest {
+		results, err := urlTest.URLTest(ctx)
+		return results, append([]string(nil), urlTest.All()...), err
 	}
-	if !selector.SelectOutbound(request.OutboundTag) {
-		return nil, status.Error(codes.NotFound, "outbound not found in selector: "+request.OutboundTag)
+	if outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup); isOutboundGroup {
+		tags := append([]string(nil), outboundGroup.All()...)
+		outbounds := common.FilterNotNil(common.Map(tags, func(it string) adapter.Outbound {
+			itOutbound, _ := boxService.outboundManager.Outbound(it)
+			return itOutbound
+		}))
+		results := group.URLTestOutbounds(ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+		return results, tags, ctx.Err()
+	}
+	delay, err := urltest.URLTest(ctx, "", outbound)
+	if err != nil {
+		historyStorage.DeleteURLTestHistory(outboundTag)
+		return map[string]uint16{}, []string{outboundTag}, nil
+	}
+	historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+	return map[string]uint16{outboundTag: delay}, []string{outboundTag}, nil
+}
+
+func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutboundRequest) (*emptypb.Empty, error) {
+	if err := s.SelectRuntimeOutbound(request.GroupTag, request.OutboundTag); err != nil {
+		return nil, grpcRuntimeControlError(err)
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -1075,35 +1141,32 @@ func buildConnectionProto(metadata *trafficcontrol.TrackerMetadata) *Connection 
 }
 
 func (s *StartedService) CloseConnection(ctx context.Context, request *CloseConnectionRequest) (*emptypb.Empty, error) {
-	s.serviceAccess.RLock()
-	boxService := s.instance
-	s.serviceAccess.RUnlock()
-	if boxService == nil {
-		return nil, os.ErrInvalid
-	}
-	if boxService.trafficManager == nil {
-		return nil, status.Error(codes.Unimplemented, "connection tracking not available")
-	}
-	targetConn := boxService.trafficManager.Connection(uuid.FromStringOrNil(request.Id))
-	if targetConn != nil {
-		targetConn.Close()
+	if err := s.CloseRuntimeConnection(request.Id); err != nil {
+		return nil, grpcRuntimeControlError(err)
 	}
 	return &emptypb.Empty{}, nil
 }
 
 func (s *StartedService) CloseAllConnections(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
-	s.serviceAccess.RLock()
-	nowService := s.instance
-	s.serviceAccess.RUnlock()
-	if nowService != nil {
-		if nowService.connectionManager != nil {
-			nowService.connectionManager.CloseAll()
-		}
-		if nowService.trafficManager != nil {
-			nowService.trafficManager.CloseAllConnections()
-		}
-	}
+	s.CloseAllRuntimeConnections()
 	return &emptypb.Empty{}, nil
+}
+
+func grpcRuntimeControlError(err error) error {
+	var controlError *RuntimeControlError
+	if !errors.As(err, &controlError) {
+		return err
+	}
+	switch controlError.Code {
+	case RuntimeControlNotFound:
+		return status.Error(codes.NotFound, controlError.Message)
+	case RuntimeControlInvalid:
+		return status.Error(codes.InvalidArgument, controlError.Message)
+	case RuntimeControlUnsupported:
+		return status.Error(codes.Unimplemented, controlError.Message)
+	default:
+		return status.Error(codes.Internal, controlError.Message)
+	}
 }
 
 func (s *StartedService) GetDeprecatedWarnings(ctx context.Context, empty *emptypb.Empty) (*DeprecatedWarnings, error) {
@@ -2084,8 +2147,9 @@ func (s *StartedService) mustEmbedUnimplementedStartedServiceServer() {
 }
 
 func (s *StartedService) WriteMessage(level log.Level, message string) {
-	item := &log.Entry{Level: level, Message: message}
 	s.logAccess.Lock()
+	s.logSequence++
+	item := &log.Entry{Sequence: s.logSequence, Time: time.Now(), Level: level, Message: message}
 	s.logLines.push(item)
 	s.logAccess.Unlock()
 	s.logSubscriber.Emit(item)

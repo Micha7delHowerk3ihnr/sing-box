@@ -53,7 +53,15 @@ func (w *platformInterfaceWrapper) AutoDetectInterfaceControl(fd int) error {
 }
 
 func (w *platformInterfaceWrapper) UsePlatformInterface() bool {
+	if selector, loaded := w.iif.(interface{ UsePlatformInterface() bool }); loaded {
+		return selector.UsePlatformInterface()
+	}
 	return true
+}
+
+func (w *platformInterfaceWrapper) UsePlatformPacketInterface() bool {
+	selector, loaded := w.iif.(interface{ UsePlatformPacketInterface() bool })
+	return loaded && selector.UsePlatformPacketInterface()
 }
 
 func (w *platformInterfaceWrapper) OpenInterface(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
@@ -66,6 +74,28 @@ func (w *platformInterfaceWrapper) OpenInterface(options *tun.Options, platformO
 	routeRanges, err := options.BuildAutoRouteRanges(true)
 	if err != nil {
 		return nil, err
+	}
+	if w.UsePlatformPacketInterface() {
+		packetProvider, loaded := w.iif.(interface {
+			OpenPacketTun(options TunOptions) (PacketTunnel, error)
+		})
+		if !loaded {
+			return nil, E.New("platform: supplied packet interface is unavailable")
+		}
+		packetTunnel, openErr := packetProvider.OpenPacketTun(&tunOptions{options, routeRanges, platformOptions})
+		if openErr != nil {
+			return nil, openErr
+		}
+		name := packetTunnel.Name()
+		if name == "" {
+			name = "packet-flow"
+		}
+		options.Name = name
+		options.InterfaceMonitor.RegisterMyInterface(name)
+		w.myTunName = name
+		w.myTunAddress = myTunAddress(options)
+		w.iif.RegisterMyInterface(name)
+		return &packetFlowTun{platform: packetTunnel, platformOptions: platformOptions, name: name}, nil
 	}
 	tunFd, err := w.iif.OpenTun(&tunOptions{options, routeRanges, platformOptions})
 	if err != nil {
@@ -175,6 +205,9 @@ func (w *platformInterfaceWrapper) RequestPermissionForWIFIState() error {
 }
 
 func (w *platformInterfaceWrapper) UsePlatformWIFIMonitor() bool {
+	if selector, loaded := w.iif.(interface{ UsePlatformWIFIMonitor() bool }); loaded {
+		return selector.UsePlatformWIFIMonitor()
+	}
 	return true
 }
 
@@ -187,6 +220,9 @@ func (w *platformInterfaceWrapper) ReadWIFIState(ctx context.Context) adapter.WI
 }
 
 func (w *platformInterfaceWrapper) UsePlatformConnectionOwnerFinder() bool {
+	if selector, loaded := w.iif.(interface{ UsePlatformConnectionOwnerFinder() bool }); loaded {
+		return selector.UsePlatformConnectionOwnerFinder()
+	}
 	return true
 }
 
@@ -235,6 +271,9 @@ func (w *platformInterfaceWrapper) DisableColors() bool {
 }
 
 func (w *platformInterfaceWrapper) UsePlatformNotification() bool {
+	if selector, loaded := w.iif.(interface{ UsePlatformNotification() bool }); loaded {
+		return selector.UsePlatformNotification()
+	}
 	return true
 }
 
@@ -247,6 +286,9 @@ func (w *platformInterfaceWrapper) CancelNotification(identifier string, typeID 
 }
 
 func (w *platformInterfaceWrapper) UsePlatformNeighborResolver() bool {
+	if selector, loaded := w.iif.(interface{ UsePlatformNeighborResolver() bool }); loaded {
+		return selector.UsePlatformNeighborResolver()
+	}
 	return true
 }
 
